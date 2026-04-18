@@ -1,0 +1,134 @@
+{
+  "updated_at": "2026-04-14",
+  "repo_root_native": "/home/frankkkz/qwen35_2b_vla",
+  "canonical_line": {
+    "name": "qwen_3.5_2b_pi0.5",
+    "config": "/home/frankkkz/qwen35_2b_vla/config/libero_train_qwen_3_5_2b_pi0_5_lora_r16_bs32_ga2_30k_native.yaml",
+    "train_log": "/home/frankkkz/qwen35_2b_vla/train_qwen35_pi05_lora_r16_bs32_ga2_30k_native.log",
+    "checkpoint": "/home/frankkkz/qwen35_2b_vla/checkpoints/qwen_3.5_2b_pi0.5_lora_r16_bs32_ga2_30k_native/checkpoint-30000",
+    "train_wall_time_minutes": 1141.8,
+    "final_step": 30000,
+    "final_train_loss": 0.0017,
+    "final_eval_mse": 0.000331,
+    "open_loop": {
+      "overall_mse": 0.00041213099818101384,
+      "overall_mae": 0.008664625158706413,
+      "gripper_sign_accuracy": 0.9997,
+      "source": "/mnt/c/Users/frank/OneDrive/Desktop/qwen35_pi05_open_closed_loop_analysis_checkpoint_30000/open_loop_analysis.json"
+    },
+    "closed_loop": {
+      "fixed_checker_spatial": {
+        "average_success_rate": 0.12,
+        "source": "/home/frankkkz/qwen35_2b_vla/tmp/eval_results_libero_spatial_checkpoint_30000_native_fixed_full.json"
+      },
+      "rtc_execution_horizon_10": {
+        "average_success_rate": 0.14,
+        "source": "/home/frankkkz/qwen35_2b_vla/tmp/eval_results_libero_spatial_checkpoint_30000_rtc_eh10.json"
+      },
+      "adaptive_highscore": {
+        "average_success_rate": 0.21,
+        "source": "/mnt/c/Users/frank/OneDrive/Desktop/qwen35_pi05_open_closed_loop_analysis_checkpoint_30000/eval_results_libero_spatial_checkpoint_30000_adaptive_highscore.json"
+      }
+    },
+    "hard_tasks": [
+      4,
+      6,
+      7,
+      9
+    ]
+  },
+  "version_timeline": [
+    {
+      "name": "v1_action_only",
+      "main_changes": [
+        "first layerwise flow-matching action head",
+        "no short history",
+        "no explicit state prompt",
+        "no explicit text grounding"
+      ],
+      "best_result": "0% average on stored partial closed-loop eval over tasks 0-2",
+      "result_source": "/home/frankkkz/qwen35_2b_vla/eval_results_closedloop_v1.json",
+      "main_blocker": "action head and runtime behavior were too weak for recovery"
+    },
+    {
+      "name": "v2_layerwise_fm",
+      "main_changes": [
+        "slimmer layerwise FM head",
+        "bs128 ga1 training",
+        "DeepSpeed full training"
+      ],
+      "best_result": "final logged eval MSE 0.000384 by 28k, but post-gripper-fix standard eval still 0%",
+      "result_source": "/home/frankkkz/qwen35_2b_vla/train_layerwise_v2_bs128_ga1_deepspeed_train_30k_bs128fresh.log",
+      "main_blocker": "downward bias, early drift, gripper chatter, weak language effect"
+    },
+    {
+      "name": "v3_stateprompt_history",
+      "main_changes": [
+        "short history tokens",
+        "explicit text conditioning",
+        "state prompt",
+        "gripper and consistency losses"
+      ],
+      "best_result": "stored smoke evals on tasks 0 and 5 are still 0%",
+      "result_source": "/home/frankkkz/qwen35_2b_vla/eval_results_v3_smoke1000_stateprompt_task0_task5_standard.json",
+      "main_blocker": "better grounding was not enough to fix recovery"
+    },
+    {
+      "name": "v4_local_frame_phase",
+      "main_changes": [
+        "local action frame",
+        "phase loss",
+        "immediate loss",
+        "dynamic loss balance",
+        "correction blend"
+      ],
+      "best_result": "stored smoke evals on tasks 0 and 5 are still 0%",
+      "result_source": "/home/frankkkz/qwen35_2b_vla/eval_results_v4_smoke1000_task0_task5_standard.json",
+      "main_blocker": "richer losses still did not close the rollout gap"
+    },
+    {
+      "name": "qwen_3.5_2b_pi0.5",
+      "main_changes": [
+        "pi0.5 chunked flow matching",
+        "suffix expert",
+        "prefix cache",
+        "AdaRMS time conditioning",
+        "RTC scaffolding",
+        "fixed checker awareness"
+      ],
+      "best_result": "12% fixed checker, 14% fixed checker + RTC, 21% adaptive high-score",
+      "result_source": "/mnt/c/Users/frank/OneDrive/Desktop/qwen35_pi05_open_closed_loop_analysis_checkpoint_30000/README.md",
+      "main_blocker": "runtime protocol and recovery still dominate the hardest tasks"
+    }
+  ],
+  "batch_tuning": {
+    "objective": "maximize throughput under time budget while staying near the stable OOM boundary",
+    "rules": [
+      "run serious probes only in native Linux",
+      "increase micro-batch before adding grad accumulation",
+      "measure sample/s and s/step instead of power.draw alone",
+      "back off one notch from the first unstable point",
+      "treat larger-but-slower batch sizes as regressions"
+    ],
+    "known_frontier": {
+      "ga1": {
+        "best_fast_point": "bs37",
+        "fails_at": "bs38",
+        "slower_even_if_it_runs": [
+          "bs40",
+          "bs48",
+          "bs64"
+        ]
+      },
+      "ga2": {
+        "canonical": "bs32",
+        "stable_but_slower": "bs33",
+        "fails_at": [
+          "bs34",
+          "bs35",
+          "bs37_from0"
+        ],
+        "failure_signature": "CUDA driver error: device not ready"
+      }
+    }
+  }

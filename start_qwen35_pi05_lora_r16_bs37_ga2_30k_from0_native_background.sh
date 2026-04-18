@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="/home/frankkkz/qwen35_2b_vla"
+LOG="$ROOT/train_qwen35_pi05_lora_r16_bs37_ga2_30k_from0_native.log"
+PIDFILE="$ROOT/train_qwen35_pi05_lora_r16_bs37_ga2_30k_from0_native.pid"
+
+cd "$ROOT"
+
+if [ -f "$PIDFILE" ]; then
+  OLD_PID="$(cat "$PIDFILE" || true)"
+  if [ -n "${OLD_PID:-}" ] && kill -0 "$OLD_PID" >/dev/null 2>&1; then
+    echo "Training already running: PID=$OLD_PID"
+    exit 0
+  fi
+fi
+
+rm -f "$PIDFILE"
+
+nohup bash "$ROOT/run_qwen35_pi05_lora_r16_bs37_ga2_30k_from0_native.sh" > "$LOG" 2>&1 < /dev/null &
+RUN_PID=$!
+echo "$RUN_PID" > "$PIDFILE"
+
+sleep 5
+if kill -0 "$RUN_PID" >/dev/null 2>&1; then
+  echo "STARTED PID=$RUN_PID"
+  echo "LOG=$LOG"
+else
+  echo "FAILED_TO_START"
+  exit 1
+fi

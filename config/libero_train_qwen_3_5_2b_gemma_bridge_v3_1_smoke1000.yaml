@@ -1,0 +1,117 @@
+# ============================================================================
+# Qwen3.5-2B v3.1 - Qwen full-attn tap -> cross-attn Gemma expert smoke1000
+# Stage 1: freeze Qwen backbone, train only bridge + Gemma expert.
+# ============================================================================
+
+model:
+  architecture: "qwen_3.5_2b_gemma_bridge_v3_1"
+  vlm_model_id: "/home/frankkkz/pretrained_models/Qwen3.5-2B"
+  attn_implementation: "sdpa"
+  freeze_vision_encoder: false
+  freeze_vlm: true
+  vlm_loss_weight: 0.0
+
+lora:
+  enabled: false
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+action_head:
+  head_type: "pi05_gemma_bridge"
+  action_expert_variant: "gemma_300m"
+  hidden_dim: 1024
+  num_heads: 8
+  num_kv_heads: 1
+  num_layers: 18
+  mlp_dim: 4096
+  dropout: 0.0
+  action_dim: 7
+  action_horizon: 50
+  chunk_size: 50
+  n_action_steps: 50
+  max_state_dim: 32
+  max_action_dim: 32
+  beta_alpha: 1.5
+  beta_beta: 1.0
+  time_sampling_scale: 0.999
+  time_sampling_offset: 0.001
+  min_period: 0.004
+  max_period: 4.0
+  num_inference_steps: 10
+  vlm_hidden_dim: 2048
+  state_dim: 8
+  state_prompt_bins: 256
+  tokenizer_max_length: 200
+  image_resolution: [224, 224]
+  empty_cameras: 0
+  tap_strategy: "last"
+  stop_gradient_backbone: true
+  bridge_norm_type: "layernorm"
+  bridge_out_dim: 1024
+  bridge_dropout: 0.0
+  bridge_gate_bias: 1.0
+  conditioning_mode: "per_layer_film"
+  use_memory_summary_conditioning: true
+  use_state_conditioning: true
+  conditioning_gate_bias: 1.0
+  memory_norm_ratio_limit: 8.0
+
+dataset:
+  name: "lerobot/libero_spatial_image"
+  data_root: "/home/frankkkz/datasets"
+  action_type: "delta_qpos"
+  image_size: [224, 224]
+  batch_size: 2
+  num_workers: 2
+  prefetch_factor: 2
+  max_train_samples: 1000
+  subset_seed: 42
+  norm_stats_sample_size: 2048
+  tokenizer_padding_side: "right"
+  tokenizer_max_length: 200
+  prompt_style: "pi05_state_prompt"
+  state_prompt_bins: 256
+  image_resize_mode: "pad"
+  empty_cameras: 0
+  shuffle: true
+  drop_last: true
+
+training:
+  max_steps: 1000
+  eval_every: 100
+  save_every: 500
+  save_optimizer_state: false
+  log_every: 10
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  seed: 42
+  gradient_checkpointing: false
+
+  optimizer: "adamw"
+  vlm_lr: 2.5e-5
+  action_lr: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+  scheduler: "cosine"
+  warmup_steps: 100
+  min_lr: 1.0e-6
+
+  mixed_precision: "bf16"
+
+  wandb_project: ""
+  wandb_run_name: "qwen_3.5_2b_gemma_bridge_v3_1_smoke1000_filmcond"
+  output_dir: "./checkpoints/qwen_3.5_2b_gemma_bridge_v3_1_smoke1000_filmcond"
+
+deepspeed:
+  config_file: "config/deepspeed_zero2_single_fast.yaml"

@@ -1,0 +1,160 @@
+versions:
+  v3.0:
+    delta: "No training. Lock official eval, preserve tuned diagnostics, and establish reference band."
+    target_bucket: "reference"
+    train_cost: "0"
+    official_eval:
+      checkpoint_band:
+        - "v1 ckpt-30000"
+        - "v2-old ckpt-30000"
+      settings:
+        chunk_size: 50
+        num_inference_steps: 10
+        temporal_ensemble_decay: 0
+        replan_horizon: null
+        action_ema_alpha: 0
+        gripper_hysteresis_steps: 0
+        gripper_min_hold_steps: 0
+    tuned_eval:
+      keep_tools:
+        - "replan_horizon"
+        - "action_ema_alpha"
+        - "gripper_hysteresis_steps"
+        - "gripper_min_hold_steps"
+        - "video bundles"
+    acceptance_focus:
+      - "Reconfirm official reference band under corrected success criterion."
+      - "Keep tuned paths available as diagnostics, never as benchmark-aligned numbers."
+    next_if:
+      default: "v3.1"
+
+  v3.1:
+    delta: "Binary gripper split only: 6D motion flow matching plus 1D gripper BCE."
+    target_bucket: "A"
+    train_cost: "1 x 30k"
+    touches:
+      - "action head output contract"
+      - "train loss decomposition"
+      - "eval postprocessing for binary gripper logits"
+    do_not_add:
+      - "phase head"
+      - "history encoder"
+      - "state residual"
+      - "local frame"
+      - "grounding auxiliary"
+    acceptance_focus:
+      - "task01/task03 official or tuned lift without new regressions."
+      - "Visible reduction of soft grasp and regrasp loops in video."
+    rollback_if:
+      - "Official overall falls and task01/task03 do not improve."
+    next_if:
+      bucket_c_dominant: "v3.2"
+      bucket_b_dominant: "v3.4"
+      mixed_but_a_improved: "v3.2"
+
+  v3.2:
+    delta: "LoRA rank 16 -> 64 only. Same target modules, no vision unfreeze."
+    target_bucket: "C"
+    train_cost: "1 x 30k"
+    touches:
+      - "training config only"
+    acceptance_focus:
+      - "Test whether current grounding weakness is mainly low adaptation capacity."
+      - "Prefer improvement on task06/task07/task09 before escalating to vision unfreeze."
+    rollback_if:
+      - "Official overall falls and Bucket C stays flat."
+    next_if:
+      bucket_c_flat: "v3.3"
+      bucket_b_or_refresh_gap: "v3.4"
+      bucket_c_improved: "accept_and_retest"
+
+  v3.3:
+    delta: "Unfreeze projector plus last 2 vision blocks at small LR only."
+    target_bucket: "C"
+    train_cost: "1 x 30k + mild memory increase"
+    touches:
+      - "vision-side trainable parameter set"
+      - "optimizer parameter groups"
+    acceptance_focus:
+      - "task06/task07/task09 move from pre-contact localization failure to later-stage control failure."
+      - "No broad regression on task00/task05 continuity."
+    rollback_if:
+      - "No Bucket C movement and overall regresses."
+    next_if:
+      residual_phase_gap: "v3.4"
+      geometric_drift: "v3.5"
+      precontact_mislocalization_persists: "v3.6"
+
+  v3.4:
+    delta: "Light phase head plus phase-aware gripper gating only."
+    target_bucket: "B"
+    train_cost: "1 x 30k + phase label generation"
+    touches:
+      - "phase head on suffix hidden state"
+      - "auxiliary CE phase loss"
+      - "runtime phase-aware gripper gating"
+    trigger_reference:
+      - "task00/task05 remain below official expectation"
+      - "task03/task08 remain well below tuned or replan references"
+    acceptance_focus:
+      - "Better continuity on task00/task05."
+      - "Cleaner stage transitions on task03/task08."
+    rollback_if:
+      - "No improvement on B or replan-sensitive tasks."
+    next_if:
+      geometric_drift: "v3.5"
+      precontact_mislocalization_persists: "v3.6"
+
+  v3.5:
+    delta: "Local EEF-frame action representation only."
+    target_bucket: "C-geometry"
+    train_cost: "1 x 30k + transform code"
+    touches:
+      - "dataset action transform"
+      - "runtime inverse transform"
+    acceptance_focus:
+      - "Reduced world-frame geometric drift on elevated-support tasks 07/09."
+    rollback_if:
+      - "No video-visible geometry improvement and official overall regresses."
+    next_if:
+      residual_grounding_gap: "v3.6"
+      otherwise: "accept_and_hold"
+
+  v3.6:
+    delta: "Grounding auxiliary localization head only."
+    target_bucket: "C-residual"
+    train_cost: "1 x 30k + localization metadata"
+    touches:
+      - "auxiliary head"
+      - "metadata extraction or bbox proxy"
+      - "auxiliary loss wiring"
+    acceptance_focus:
+      - "Residual Bucket C failures improve before contact."
+      - "Grounding improvement survives official eval, not only tuned diagnostics."
+    rollback_if:
+      - "Auxiliary objective adds complexity without Bucket C lift."
+    next_if:
+      otherwise: "re-evaluate roadmap"
+
+diagnostic_packs:
+  bucket_a:
+    tasks: ["task01", "task03", "task08"]
+    evals:
+      - "official slice"
+      - "tuned or replan references where already validated"
+  bucket_b:
+    tasks: ["task00", "task05"]
+    evals:
+      - "official slice"
+      - "replan diagnostic only as analysis, not benchmark"
+  bucket_c:
+    tasks: ["task04", "task06", "task07", "task09"]
+    evals:
+      - "official slice"
+      - "2 to 3 recorded videos for weakest tasks"
+
+global_rules:
+  - "One module delta per version."
+  - "Official and tuned numbers must never be mixed."
+  - "Every promotion decision must cite the dominant remaining bucket."
+  - "Rollback if the targeted bucket does not improve materially."

@@ -1,0 +1,38 @@
+{
+  "type": "object",
+  "properties": {
+    "final_decision": {
+      "type": "string",
+      "enum": ["accept", "rollback", "ambiguous"]
+    },
+    "agreed_bucket": {
+      "type": "string",
+      "enum": [
+        "A_refresh_or_gripper",
+        "B_continuity",
+        "C_grounding_or_subtask",
+        "mixed"
+      ]
+    },
+    "recommended_next_version": {
+      "type": "string"
+    },
+    "shared_rationale": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1
+    },
+    "disagreements": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+  "required": [
+    "final_decision",
+    "agreed_bucket",
+    "recommended_next_version",
+    "shared_rationale",
+    "disagreements"
+  ],
+  "additionalProperties": false
+}
