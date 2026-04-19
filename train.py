@@ -99,10 +99,10 @@ def build_policy_contract(cfg) -> tuple[dict, dict]:
     head_type = str(action_cfg.get("head_type", "single_fm"))
     use_state_prompt = bool(action_cfg.get("use_state_prompt", False))
     image_size = list(cfg.dataset.get("image_size", [224, 224]))
-    if architecture == "qwen_3.5_2b_gemma_bridge_v3_1":
+    if architecture in {"qwen_3.5_2b_gemma_bridge_v3_1", "qwen_3.5_2b_gemma_bridge_v3_2"}:
         pre = {
             "name": "policy_preprocessor",
-            "version": "qwen_3.5_2b_gemma_bridge_v3_1",
+            "version": "qwen_3.5_2b_gemma_bridge_v3_2",
             "images": {
                 "order": ["observation.images.image", "observation.images.wrist_image"],
                 "count": 2 + int(cfg.dataset.get("empty_cameras", 0)),
@@ -155,23 +155,32 @@ def build_policy_contract(cfg) -> tuple[dict, dict]:
                 "reverse_time_sampler": True,
                 "num_inference_steps": int(action_cfg.get("num_inference_steps", 10)),
                 "bridge": {
-                    "type": "cross_attention",
-                    "tap_strategy": str(action_cfg.get("tap_strategy", "last")),
+                    "type": str(action_cfg.get("bridge_type", "gr00t_query_bridge")),
+                    "memory_layout": "bridge_query_tokens",
+                    "tap_strategy": str(action_cfg.get("tap_strategy", "all_concat")),
                     "stop_gradient_backbone": bool(action_cfg.get("stop_gradient_backbone", True)),
                     "bridge_norm_type": str(action_cfg.get("bridge_norm_type", "layernorm")),
-                    "bridge_out_dim": int(action_cfg.get("bridge_out_dim", action_cfg.get("hidden_dim", 1024))),
+                    "bridge_policy_dim": int(
+                        action_cfg.get(
+                            "bridge_policy_dim",
+                            action_cfg.get("bridge_out_dim", action_cfg.get("hidden_dim", 1024)),
+                        )
+                    ),
+                    "bridge_num_queries": int(action_cfg.get("bridge_num_queries", 8)),
+                    "bridge_layers": int(action_cfg.get("bridge_layers", 2)),
+                    "bridge_scalar_mix": bool(action_cfg.get("bridge_scalar_mix", False)),
+                    "bridge_scalar_mix_init": str(action_cfg.get("bridge_scalar_mix_init", "uniform")),
+                    "bridge_scalar_mix_use_gamma": bool(
+                        action_cfg.get("bridge_scalar_mix_use_gamma", True)
+                    ),
+                    "bridge_use_state_token": bool(action_cfg.get("bridge_use_state_token", True)),
+                    "bridge_use_tap_embeddings": bool(action_cfg.get("bridge_use_tap_embeddings", True)),
+                    "bridge_use_token_type_embeddings": bool(
+                        action_cfg.get("bridge_use_token_type_embeddings", True)
+                    ),
+                    "bridge_dropout": float(action_cfg.get("bridge_dropout", 0.0)),
+                    "bridge_gate_bias": float(action_cfg.get("bridge_gate_bias", 0.0)),
                     "action_expert_variant": str(action_cfg.get("action_expert_variant", "gemma_300m")),
-                    "conditioning_mode": str(action_cfg.get("conditioning_mode", "per_layer_film")),
-                    "use_memory_summary_conditioning": bool(
-                        action_cfg.get("use_memory_summary_conditioning", True)
-                    ),
-                    "use_text_summary_conditioning": bool(
-                        action_cfg.get("use_text_summary_conditioning", True)
-                    ),
-                    "use_instruction_summary_conditioning": bool(
-                        action_cfg.get("use_instruction_summary_conditioning", True)
-                    ),
-                    "use_state_conditioning": bool(action_cfg.get("use_state_conditioning", True)),
                     "use_action_input_conditioning": bool(
                         action_cfg.get("use_action_input_conditioning", True)
                     ),
@@ -358,7 +367,7 @@ def build_model(cfg):
     # Build action head config
     ah_cfg = cfg.action_head
     head_type = ah_cfg.get("head_type", "single_fm")
-    if architecture == "qwen_3.5_2b_gemma_bridge_v3_1":
+    if architecture in {"qwen_3.5_2b_gemma_bridge_v3_1", "qwen_3.5_2b_gemma_bridge_v3_2"}:
         variant_name = str(ah_cfg.get("action_expert_variant", "gemma_300m"))
         variant_defaults = ACTION_EXPERT_VARIANTS.get(variant_name)
         if variant_defaults is None:
@@ -397,29 +406,34 @@ def build_model(cfg):
             ),
             image_resolution=(int(image_resolution[0]), int(image_resolution[1])),
             empty_cameras=int(ah_cfg.get("empty_cameras", cfg.dataset.get("empty_cameras", 0))),
-            tap_strategy=str(ah_cfg.get("tap_strategy", "last")),
+            bridge_type=str(ah_cfg.get("bridge_type", "gr00t_query_bridge")),
+            tap_strategy=str(ah_cfg.get("tap_strategy", "all_concat")),
             stop_gradient_backbone=bool(ah_cfg.get("stop_gradient_backbone", True)),
             bridge_norm_type=str(ah_cfg.get("bridge_norm_type", "layernorm")),
             bridge_out_dim=int(ah_cfg.get("bridge_out_dim", 0)),
             bridge_dropout=float(ah_cfg.get("bridge_dropout", 0.0)),
             bridge_gate_bias=float(ah_cfg.get("bridge_gate_bias", 0.0)),
-            conditioning_mode=str(ah_cfg.get("conditioning_mode", "per_layer_film")),
-            use_memory_summary_conditioning=bool(
-                ah_cfg.get("use_memory_summary_conditioning", True)
+            bridge_num_queries=int(ah_cfg.get("bridge_num_queries", 8)),
+            bridge_layers=int(ah_cfg.get("bridge_layers", 2)),
+            bridge_policy_dim=int(
+                ah_cfg.get(
+                    "bridge_policy_dim",
+                    ah_cfg.get("bridge_out_dim", variant_defaults["hidden_dim"]),
+                )
             ),
-            use_text_summary_conditioning=bool(
-                ah_cfg.get("use_text_summary_conditioning", True)
+            bridge_use_state_token=bool(ah_cfg.get("bridge_use_state_token", True)),
+            bridge_use_tap_embeddings=bool(ah_cfg.get("bridge_use_tap_embeddings", True)),
+            bridge_use_token_type_embeddings=bool(
+                ah_cfg.get("bridge_use_token_type_embeddings", True)
             ),
-            use_instruction_summary_conditioning=bool(
-                ah_cfg.get("use_instruction_summary_conditioning", True)
-            ),
-            use_state_conditioning=bool(ah_cfg.get("use_state_conditioning", True)),
+            bridge_max_taps=int(ah_cfg.get("bridge_max_taps", 64)),
+            bridge_num_token_types=int(ah_cfg.get("bridge_num_token_types", 8)),
+            bridge_scalar_mix=bool(ah_cfg.get("bridge_scalar_mix", False)),
+            bridge_scalar_mix_init=str(ah_cfg.get("bridge_scalar_mix_init", "uniform")),
+            bridge_scalar_mix_use_gamma=bool(ah_cfg.get("bridge_scalar_mix_use_gamma", True)),
             use_action_input_conditioning=bool(
                 ah_cfg.get("use_action_input_conditioning", True)
             ),
-            memory_summary_gain_init=float(ah_cfg.get("memory_summary_gain_init", 1.0)),
-            text_summary_gain_init=float(ah_cfg.get("text_summary_gain_init", 2.0)),
-            instruction_summary_gain_init=float(ah_cfg.get("instruction_summary_gain_init", 3.0)),
             action_input_gain_init=float(ah_cfg.get("action_input_gain_init", 0.5)),
             conditioning_gate_bias=float(ah_cfg.get("conditioning_gate_bias", 1.0)),
             memory_norm_ratio_limit=float(ah_cfg.get("memory_norm_ratio_limit", 8.0)),
@@ -609,7 +623,7 @@ def build_model(cfg):
             ])),
         }
 
-    if architecture == "qwen_3.5_2b_gemma_bridge_v3_1":
+    if architecture in {"qwen_3.5_2b_gemma_bridge_v3_1", "qwen_3.5_2b_gemma_bridge_v3_2"}:
         model = Qwen35GemmaBridgeVLA(
             vlm_model_id=cfg.model.vlm_model_id,
             action_config=action_config,
@@ -900,9 +914,9 @@ def evaluate(model, dataloader, accelerator, max_batches: int = 50):
                 )
                 norm_actions = unwrapped.action_head.predict_action(
                     prefix_memory=prefix_memory["memory"],
-                    prefix_attention_mask=prefix_memory["attention_mask"],
-                    prefix_text_attention_mask=prefix_memory.get("text_attention_mask"),
-                    instruction_summary=prefix_memory.get("instruction_summary"),
+                    prefix_attention_mask=prefix_memory["memory_mask"],
+                    tap_ids=prefix_memory.get("tap_ids"),
+                    token_type_ids=prefix_memory.get("token_type_ids"),
                     state=norm_state,
                 )
             else:
@@ -1161,6 +1175,16 @@ def main():
     running_weight_gripper = 0.0
     running_weight_phase = 0.0
     running_weight_immediate = 0.0
+    running_raw_qwen_token_norm = 0.0
+    running_bridge_token_norm = 0.0
+    running_query_token_norm = 0.0
+    running_bridge_memory_norm = 0.0
+    running_expert_token_norm = 0.0
+    running_cross_attn_entropy = 0.0
+    running_memory_norm_ratio = 0.0
+    running_tap_weight_entropy = 0.0
+    running_scalar_mix_gamma = 0.0
+    running_mean_norm_saturation_fraction = 0.0
     start_time = time.time()
     last_saved_step = None
     last_eval_metrics = None
@@ -1243,6 +1267,28 @@ def main():
             running_weight_phase += outputs["loss_weight_phase"].detach().float().mean().item()
         if "loss_weight_immediate" in outputs:
             running_weight_immediate += outputs["loss_weight_immediate"].detach().float().mean().item()
+        if "raw_qwen_token_norm" in outputs:
+            running_raw_qwen_token_norm += outputs["raw_qwen_token_norm"].detach().float().mean().item()
+        if "bridge_token_norm" in outputs:
+            running_bridge_token_norm += outputs["bridge_token_norm"].detach().float().mean().item()
+        if "query_token_norm" in outputs:
+            running_query_token_norm += outputs["query_token_norm"].detach().float().mean().item()
+        if "bridge_memory_norm" in outputs:
+            running_bridge_memory_norm += outputs["bridge_memory_norm"].detach().float().mean().item()
+        if "expert_token_norm" in outputs:
+            running_expert_token_norm += outputs["expert_token_norm"].detach().float().mean().item()
+        if "cross_attn_entropy" in outputs:
+            running_cross_attn_entropy += outputs["cross_attn_entropy"].detach().float().mean().item()
+        if "memory_norm_ratio" in outputs:
+            running_memory_norm_ratio += outputs["memory_norm_ratio"].detach().float().mean().item()
+        if "tap_weight_entropy" in outputs:
+            running_tap_weight_entropy += outputs["tap_weight_entropy"].detach().float().mean().item()
+        if "scalar_mix_gamma" in outputs:
+            running_scalar_mix_gamma += outputs["scalar_mix_gamma"].detach().float().mean().item()
+        if "mean_norm_saturation_fraction" in outputs:
+            running_mean_norm_saturation_fraction += (
+                outputs["mean_norm_saturation_fraction"].detach().float().mean().item()
+            )
 
         if micro_step % int(tcfg.gradient_accumulation_steps) == 0:
             global_step += 1
@@ -1264,6 +1310,18 @@ def main():
                 avg_weight_gripper = running_weight_gripper / log_micros
                 avg_weight_phase = running_weight_phase / log_micros
                 avg_weight_immediate = running_weight_immediate / log_micros
+                avg_raw_qwen_token_norm = running_raw_qwen_token_norm / log_micros
+                avg_bridge_token_norm = running_bridge_token_norm / log_micros
+                avg_query_token_norm = running_query_token_norm / log_micros
+                avg_bridge_memory_norm = running_bridge_memory_norm / log_micros
+                avg_expert_token_norm = running_expert_token_norm / log_micros
+                avg_cross_attn_entropy = running_cross_attn_entropy / log_micros
+                avg_memory_norm_ratio = running_memory_norm_ratio / log_micros
+                avg_tap_weight_entropy = running_tap_weight_entropy / log_micros
+                avg_scalar_mix_gamma = running_scalar_mix_gamma / log_micros
+                avg_mean_norm_saturation_fraction = (
+                    running_mean_norm_saturation_fraction / log_micros
+                )
                 elapsed = time.time() - start_time
                 sec_per_step = elapsed / global_step
                 steps_per_sec = 1.0 / sec_per_step if sec_per_step > 0 else 0.0
@@ -1308,6 +1366,24 @@ def main():
                         f"gripper={avg_gripper:.4f} "
                         f"phase={avg_phase:.4f} |"
                     )
+                elif cfg.action_head.get("head_type", "single_fm") == "pi05_gemma_bridge":
+                    _sm_suffix = ""
+                    if bool(cfg.action_head.get("bridge_scalar_mix", False)):
+                        _sm_suffix = (
+                            f" tapH={avg_tap_weight_entropy:.3f} "
+                            f"gamma={avg_scalar_mix_gamma:.3f}"
+                        )
+                    aux_status = (
+                        f" motion={avg_motion:.4f} "
+                        f"qwen={avg_raw_qwen_token_norm:.3f} "
+                        f"bridge={avg_bridge_token_norm:.3f} "
+                        f"query={avg_query_token_norm:.3f} "
+                        f"expert={avg_expert_token_norm:.3f} "
+                        f"entropy={avg_cross_attn_entropy:.3f} "
+                        f"ratio={avg_memory_norm_ratio:.3f}"
+                        f"{_sm_suffix} "
+                        f"sat={avg_mean_norm_saturation_fraction:.3f} |"
+                    )
                 print(
                     f"[{timestamp}] Step {global_step}/{tcfg.max_steps} | "
                     f"loss={avg_loss:.4f} action={avg_action:.4f} {vlm_status} |"
@@ -1347,6 +1423,21 @@ def main():
                         log_payload["train/motion_loss"] = avg_motion
                         log_payload["train/gripper_loss"] = avg_gripper
                         log_payload["train/phase_loss"] = avg_phase
+                    elif cfg.action_head.get("head_type", "single_fm") == "pi05_gemma_bridge":
+                        log_payload["train/motion_loss"] = avg_motion
+                        log_payload["train/raw_qwen_token_norm"] = avg_raw_qwen_token_norm
+                        log_payload["train/bridge_token_norm"] = avg_bridge_token_norm
+                        log_payload["train/query_token_norm"] = avg_query_token_norm
+                        log_payload["train/bridge_memory_norm"] = avg_bridge_memory_norm
+                        log_payload["train/expert_token_norm"] = avg_expert_token_norm
+                        log_payload["train/cross_attn_entropy"] = avg_cross_attn_entropy
+                        log_payload["train/memory_norm_ratio"] = avg_memory_norm_ratio
+                        log_payload["train/mean_norm_saturation_fraction"] = (
+                            avg_mean_norm_saturation_fraction
+                        )
+                        if bool(cfg.action_head.get("bridge_scalar_mix", False)):
+                            log_payload["train/tap_weight_entropy"] = avg_tap_weight_entropy
+                            log_payload["train/scalar_mix_gamma"] = avg_scalar_mix_gamma
                     if torch.cuda.is_available():
                         log_payload["train/gpu_alloc_gb"] = mem_alloc_gb
                         log_payload["train/gpu_reserved_gb"] = mem_reserved_gb
@@ -1365,6 +1456,16 @@ def main():
                 running_weight_gripper = 0.0
                 running_weight_phase = 0.0
                 running_weight_immediate = 0.0
+                running_raw_qwen_token_norm = 0.0
+                running_bridge_token_norm = 0.0
+                running_query_token_norm = 0.0
+                running_bridge_memory_norm = 0.0
+                running_expert_token_norm = 0.0
+                running_cross_attn_entropy = 0.0
+                running_memory_norm_ratio = 0.0
+                running_tap_weight_entropy = 0.0
+                running_scalar_mix_gamma = 0.0
+                running_mean_norm_saturation_fraction = 0.0
 
             # Evaluation
             if global_step % tcfg.eval_every == 0:

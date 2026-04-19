@@ -43,21 +43,26 @@ class QwenGemmaBridgeActionConfig:
     image_resolution: tuple[int, int] = (224, 224)
     empty_cameras: int = 0
 
+    bridge_type: str = "gr00t_query_bridge"
     tap_strategy: str = "last"
     stop_gradient_backbone: bool = True
     bridge_norm_type: str = "layernorm"
     bridge_out_dim: int = 0
     bridge_dropout: float = 0.0
     bridge_gate_bias: float = 0.0
-    conditioning_mode: str = "per_layer_film"
-    use_memory_summary_conditioning: bool = True
-    use_text_summary_conditioning: bool = True
-    use_instruction_summary_conditioning: bool = True
-    use_state_conditioning: bool = True
+    bridge_num_queries: int = 8
+    bridge_layers: int = 2
+    bridge_policy_dim: int = 0
+    bridge_use_state_token: bool = True
+    bridge_use_tap_embeddings: bool = True
+    bridge_use_token_type_embeddings: bool = True
+    bridge_max_taps: int = 64
+    bridge_num_token_types: int = 8
+    bridge_scalar_mix: bool = False
+    bridge_scalar_mix_init: str = "uniform"
+    bridge_scalar_mix_use_gamma: bool = True
+
     use_action_input_conditioning: bool = True
-    memory_summary_gain_init: float = 1.0
-    text_summary_gain_init: float = 2.0
-    instruction_summary_gain_init: float = 3.0
     action_input_gain_init: float = 0.5
     conditioning_gate_bias: float = 1.0
     memory_norm_ratio_limit: float = 8.0
@@ -77,16 +82,37 @@ class QwenGemmaBridgeActionConfig:
             self.num_layers = int(defaults["num_layers"])
         if self.mlp_dim <= 0:
             self.mlp_dim = int(self.hidden_dim * 4)
+        if self.bridge_policy_dim <= 0:
+            self.bridge_policy_dim = int(self.bridge_out_dim or self.hidden_dim)
         if self.bridge_out_dim <= 0:
-            self.bridge_out_dim = int(self.hidden_dim)
+            self.bridge_out_dim = int(self.bridge_policy_dim)
         if self.hidden_dim % self.num_heads != 0:
             raise ValueError(
                 f"hidden_dim ({self.hidden_dim}) must be divisible by num_heads ({self.num_heads})"
+            )
+        if self.bridge_policy_dim % self.num_heads != 0:
+            raise ValueError(
+                f"bridge_policy_dim ({self.bridge_policy_dim}) must be divisible by num_heads ({self.num_heads})"
             )
         if self.num_heads % self.num_kv_heads != 0:
             raise ValueError(
                 f"num_heads ({self.num_heads}) must be divisible by num_kv_heads ({self.num_kv_heads})"
             )
+        if str(self.bridge_type).lower() != "gr00t_query_bridge":
+            raise ValueError(
+                f"Unsupported bridge_type={self.bridge_type}. Expected 'gr00t_query_bridge'"
+            )
+        if str(self.tap_strategy).lower() not in {"last", "all_concat", "scalar_mix"}:
+            raise ValueError(
+                f"Unsupported tap_strategy={self.tap_strategy}. Expected one of ['last', 'all_concat', 'scalar_mix']"
+            )
+        if str(self.bridge_scalar_mix_init).lower() not in {"uniform", "last_bias"}:
+            raise ValueError(
+                "Unsupported bridge_scalar_mix_init="
+                f"{self.bridge_scalar_mix_init}. Expected one of ['uniform', 'last_bias']"
+            )
+        if str(self.tap_strategy).lower() == "scalar_mix":
+            self.bridge_scalar_mix = True
         self.chunk_size = int(self.chunk_size)
         self.action_horizon = int(self.action_horizon)
         self.n_action_steps = int(self.n_action_steps)
@@ -94,6 +120,10 @@ class QwenGemmaBridgeActionConfig:
         self.max_action_dim = int(self.max_action_dim)
         self.max_state_dim = int(self.max_state_dim)
         self.state_dim = int(self.state_dim)
+        self.bridge_num_queries = int(self.bridge_num_queries)
+        self.bridge_layers = int(self.bridge_layers)
+        self.bridge_max_taps = int(self.bridge_max_taps)
+        self.bridge_num_token_types = int(self.bridge_num_token_types)
         self.image_resolution = (
             int(self.image_resolution[0]),
             int(self.image_resolution[1]),
@@ -102,10 +132,6 @@ class QwenGemmaBridgeActionConfig:
         if self.action_dim > self.max_action_dim:
             raise ValueError(
                 f"action_dim ({self.action_dim}) cannot exceed max_action_dim ({self.max_action_dim})"
-            )
-        if str(self.conditioning_mode).lower() != "per_layer_film":
-            raise ValueError(
-                f"Unsupported conditioning_mode={self.conditioning_mode}. Expected 'per_layer_film'"
             )
 
 
@@ -137,8 +163,6 @@ def gated_residual(
 
 
 class GemmaAdaRMSNorm(nn.Module):
-    """AdaRMS modulation for per-layer FiLM conditioning."""
-
     def __init__(
         self,
         dim: int,
@@ -210,6 +234,7 @@ class GemmaAttention(nn.Module):
         num_kv_heads: int,
         dropout: float = 0.0,
         use_rope: bool = True,
+        record_attention_stats: bool = False,
     ):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -218,12 +243,14 @@ class GemmaAttention(nn.Module):
         self.head_dim = self.hidden_dim // self.num_heads
         self.dropout = float(dropout)
         self.use_rope = bool(use_rope)
+        self.record_attention_stats = bool(record_attention_stats)
 
         self.q_proj = nn.Linear(self.hidden_dim, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_dim, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_dim, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_dim, bias=False)
         self.rotary_emb = RotaryEmbedding(self.head_dim) if self.use_rope else None
+        self.last_attn_entropy: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -248,17 +275,24 @@ class GemmaAttention(nn.Module):
         k = repeat_kv(k, n_rep)
         v = repeat_kv(v, n_rep)
 
-        attn_mask = None
+        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        valid_mask = None
         if key_padding_mask is not None:
-            attn_mask = key_padding_mask[:, None, None, :].to(device=q.device, dtype=torch.bool)
+            valid_mask = key_padding_mask[:, None, None, :].to(device=scores.device, dtype=torch.bool)
+            scores = scores.masked_fill(~valid_mask, torch.finfo(scores.dtype).min)
 
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout if self.training else 0.0,
-        )
+        probs = torch.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
+        if self.training and self.dropout > 0.0:
+            probs = F.dropout(probs, p=self.dropout)
+        if self.record_attention_stats:
+            entropy = -(probs.clamp_min(1e-8).log() * probs).sum(dim=-1).mean()
+            self.last_attn_entropy = entropy
+        else:
+            self.last_attn_entropy = None
+        if valid_mask is not None:
+            probs = probs.masked_fill(~valid_mask, 0.0)
+
+        attn_out = torch.matmul(probs, v)
         attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, target_len, self.hidden_dim)
         return self.o_proj(attn_out)
 
@@ -271,7 +305,8 @@ class GemmaMLP(nn.Module):
         self.down_proj = nn.Linear(mlp_dim, hidden_dim, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.gelu(self.gate_proj(hidden_states), approximate="tanh") * self.up_proj(hidden_states))
+        gated = F.gelu(self.gate_proj(hidden_states), approximate="tanh")
+        return self.down_proj(gated * self.up_proj(hidden_states))
 
 
 class GemmaExpertBlock(nn.Module):
@@ -301,6 +336,7 @@ class GemmaExpertBlock(nn.Module):
             num_kv_heads=num_kv_heads,
             dropout=dropout,
             use_rope=False,
+            record_attention_stats=True,
         )
         self.post_cross_attn_adarms = GemmaAdaRMSNorm(hidden_dim, cond_dim, gate_bias=gate_bias)
         self.mlp = GemmaMLP(hidden_dim=hidden_dim, mlp_dim=mlp_dim)
@@ -358,6 +394,7 @@ class GemmaActionExpert(nn.Module):
             ]
         )
         self.final_norm = GemmaRMSNorm(hidden_dim)
+        self.last_cross_attn_entropy: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -366,6 +403,7 @@ class GemmaActionExpert(nn.Module):
         expert_cond: torch.Tensor,
         memory_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        entropies = []
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states,
@@ -373,10 +411,15 @@ class GemmaActionExpert(nn.Module):
                 expert_cond=expert_cond,
                 memory_mask=memory_mask,
             )
+            if layer.cross_attn.last_attn_entropy is not None:
+                entropies.append(layer.cross_attn.last_attn_entropy)
+        self.last_cross_attn_entropy = (
+            torch.stack(entropies).mean() if entropies else None
+        )
         return self.final_norm(hidden_states)
 
 
-class QwenMemoryBridge(nn.Module):
+class QwenTokenProjector(nn.Module):
     def __init__(
         self,
         in_dim: int,
@@ -392,20 +435,241 @@ class QwenMemoryBridge(nn.Module):
         elif norm_key == "rmsnorm":
             self.norm = GemmaRMSNorm(in_dim)
         else:
-            raise ValueError(f"Unsupported bridge_norm_type={norm_type}. Expected one of ['layernorm', 'rmsnorm']")
+            raise ValueError(
+                f"Unsupported bridge_norm_type={norm_type}. Expected one of ['layernorm', 'rmsnorm']"
+            )
         self.proj = nn.Linear(in_dim, out_dim, bias=True)
         self.dropout = nn.Dropout(dropout)
         self.gate = nn.Parameter(torch.tensor(float(gate_bias)))
         self.scale = nn.Parameter(torch.ones(1))
 
     def forward(self, memory: torch.Tensor) -> torch.Tensor:
-        bridged = self.proj(self.norm(memory))
-        gate = torch.sigmoid(self.gate).to(dtype=bridged.dtype)
-        return self.dropout(bridged) * gate * self.scale.to(dtype=bridged.dtype)
+        projected = self.proj(self.norm(memory))
+        gate = torch.sigmoid(self.gate).to(dtype=projected.dtype)
+        return self.dropout(projected) * gate * self.scale.to(dtype=projected.dtype)
+
+
+class TapScalarMixer(nn.Module):
+    """ELMo-style scalar mix over concatenated Qwen full-attention tap tokens."""
+
+    def __init__(
+        self,
+        max_taps: int,
+        init: str = "uniform",
+        use_gamma: bool = True,
+    ):
+        super().__init__()
+        self.max_taps = int(max_taps)
+        self.use_gamma = bool(use_gamma)
+        self.tap_logits = nn.Parameter(torch.zeros(self.max_taps))
+        if str(init).lower() == "last_bias":
+            with torch.no_grad():
+                ramp = torch.linspace(-1.0, 1.0, steps=self.max_taps)
+                self.tap_logits.copy_(ramp)
+        elif str(init).lower() != "uniform":
+            raise ValueError(
+                f"Unsupported scalar mix init={init}. Expected one of ['uniform', 'last_bias']"
+            )
+        if self.use_gamma:
+            self.gamma = nn.Parameter(torch.ones(1))
+        else:
+            self.register_buffer("gamma", torch.ones(1), persistent=False)
+
+    def _unique_tap_ids(self, tap_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        first_row = tap_ids[0]
+        unique_ids, counts = torch.unique_consecutive(first_row, return_counts=True)
+        if unique_ids.numel() == 0:
+            raise ValueError("scalar_mix received empty tap_ids")
+        if counts.unique().numel() != 1:
+            raise ValueError(
+                "scalar_mix expects concatenated taps with equal token counts per tap"
+            )
+        return unique_ids, counts
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        memory_mask: torch.Tensor,
+        tap_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        if tap_ids is None:
+            raise ValueError("scalar_mix requires tap_ids from the Qwen backbone adapter")
+        if tokens.ndim != 3:
+            raise ValueError(f"scalar_mix expects rank-3 tokens, got shape={tuple(tokens.shape)}")
+
+        tap_ids = tap_ids.to(device=tokens.device, dtype=torch.long)
+        memory_mask = memory_mask.to(device=tokens.device, dtype=torch.bool)
+        unique_ids, counts = self._unique_tap_ids(tap_ids)
+        num_taps = int(unique_ids.numel())
+        tap_width = int(counts[0].item())
+        if tokens.shape[1] != num_taps * tap_width:
+            raise ValueError(
+                "scalar_mix received unexpected memory layout: "
+                f"seq={tokens.shape[1]} vs taps={num_taps} width={tap_width}"
+            )
+
+        tap_param_indices = unique_ids.clamp(min=0, max=self.max_taps - 1)
+        weights = torch.softmax(self.tap_logits[tap_param_indices].float(), dim=0).to(dtype=tokens.dtype)
+        gamma = self.gamma.to(device=tokens.device, dtype=tokens.dtype)
+
+        reshaped_tokens = tokens.reshape(tokens.shape[0], num_taps, tap_width, tokens.shape[-1])
+        reshaped_mask = memory_mask.reshape(memory_mask.shape[0], num_taps, tap_width)
+        mixed_tokens = (reshaped_tokens * weights.view(1, num_taps, 1, 1)).sum(dim=1)
+        mixed_tokens = mixed_tokens * gamma.view(1, 1, 1)
+        mixed_mask = reshaped_mask.any(dim=1)
+
+        stats = {
+            "tap_weight_distribution": weights.float(),
+            "tap_weight_entropy": (-(weights.float().clamp_min(1e-8).log() * weights.float()).sum()),
+            "scalar_mix_gamma": gamma.float().view(()),
+        }
+        return mixed_tokens, mixed_mask, stats
+
+
+class GR00TQueryBridge(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        policy_dim: int,
+        num_queries: int,
+        num_layers: int,
+        num_heads: int,
+        state_dim: int,
+        dropout: float = 0.0,
+        norm_type: str = "layernorm",
+        gate_bias: float = 0.0,
+        use_state_token: bool = True,
+        use_tap_embeddings: bool = True,
+        use_token_type_embeddings: bool = True,
+        max_taps: int = 64,
+        num_token_types: int = 8,
+        scalar_mix: bool = False,
+        scalar_mix_init: str = "uniform",
+        scalar_mix_use_gamma: bool = True,
+    ):
+        super().__init__()
+        self.policy_dim = int(policy_dim)
+        self.num_queries = int(num_queries)
+        self.state_dim = int(state_dim)
+        self.use_state_token = bool(use_state_token)
+        self.use_tap_embeddings = bool(use_tap_embeddings)
+        self.use_token_type_embeddings = bool(use_token_type_embeddings)
+        self.use_scalar_mix = bool(scalar_mix)
+
+        self.token_proj = QwenTokenProjector(
+            in_dim=in_dim,
+            out_dim=self.policy_dim,
+            norm_type=norm_type,
+            dropout=dropout,
+            gate_bias=gate_bias,
+        )
+        self.query_tokens = nn.Parameter(
+            torch.randn(self.num_queries, self.policy_dim) / math.sqrt(max(self.policy_dim, 1))
+        )
+        self.state_proj = nn.Linear(self.state_dim, self.policy_dim, bias=True)
+        self.tap_embeddings = nn.Embedding(int(max_taps), self.policy_dim)
+        self.token_type_embeddings = nn.Embedding(int(num_token_types), self.policy_dim)
+        self.scalar_mixer = None
+        if self.use_scalar_mix:
+            self.scalar_mixer = TapScalarMixer(
+                max_taps=int(max_taps),
+                init=scalar_mix_init,
+                use_gamma=scalar_mix_use_gamma,
+            )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.policy_dim,
+            nhead=int(num_heads),
+            dim_feedforward=self.policy_dim * 4,
+            dropout=float(dropout),
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=int(num_layers))
+        self.final_norm = nn.LayerNorm(self.policy_dim)
+
+    def forward(
+        self,
+        memory: torch.Tensor,
+        memory_mask: Optional[torch.Tensor],
+        state: Optional[torch.Tensor] = None,
+        tap_ids: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        batch_size = memory.shape[0]
+        if memory_mask is None:
+            memory_mask = torch.ones(
+                batch_size,
+                memory.shape[1],
+                device=memory.device,
+                dtype=torch.bool,
+            )
+        else:
+            memory_mask = memory_mask.to(device=memory.device, dtype=torch.bool)
+
+        projected = self.token_proj(memory)
+        if self.use_tap_embeddings and tap_ids is not None:
+            tap_ids = tap_ids.to(device=projected.device, dtype=torch.long)
+            tap_ids = tap_ids.clamp(min=0, max=self.tap_embeddings.num_embeddings - 1)
+            projected = projected + self.tap_embeddings(tap_ids).to(dtype=projected.dtype)
+        if self.use_token_type_embeddings and token_type_ids is not None:
+            token_type_ids = token_type_ids.to(device=projected.device, dtype=torch.long)
+            token_type_ids = token_type_ids.clamp(min=0, max=self.token_type_embeddings.num_embeddings - 1)
+            projected = projected + self.token_type_embeddings(token_type_ids).to(dtype=projected.dtype)
+        scalar_mix_stats: Dict[str, torch.Tensor] = {}
+        if self.scalar_mixer is not None:
+            projected, memory_mask, scalar_mix_stats = self.scalar_mixer(
+                tokens=projected,
+                memory_mask=memory_mask,
+                tap_ids=tap_ids,
+            )
+
+        context_tokens = projected
+        context_mask = memory_mask
+        if self.use_state_token:
+            if state is None:
+                state_token = torch.zeros(
+                    batch_size,
+                    1,
+                    self.policy_dim,
+                    device=projected.device,
+                    dtype=projected.dtype,
+                )
+            else:
+                state = state.to(
+                    device=self.state_proj.weight.device,
+                    dtype=self.state_proj.weight.dtype,
+                )
+                state = state[..., : self.state_dim]
+                state_token = self.state_proj(state).to(device=projected.device, dtype=projected.dtype)
+                state_token = state_token.unsqueeze(1)
+            context_tokens = torch.cat([state_token, context_tokens], dim=1)
+            context_mask = torch.cat(
+                [
+                    torch.ones(batch_size, 1, device=context_mask.device, dtype=torch.bool),
+                    context_mask,
+                ],
+                dim=1,
+            )
+
+        queries = self.query_tokens.unsqueeze(0).expand(batch_size, -1, -1).to(dtype=context_tokens.dtype)
+        query_mask = torch.ones(batch_size, self.num_queries, device=context_mask.device, dtype=torch.bool)
+        tokens = torch.cat([queries, context_tokens], dim=1)
+        token_mask = torch.cat([query_mask, context_mask], dim=1)
+
+        encoded = self.encoder(tokens, src_key_padding_mask=~token_mask)
+        query_tokens = self.final_norm(encoded[:, : self.num_queries])
+        stats = {
+            "raw_qwen_token_norm": memory.float().norm(dim=-1).mean(),
+            "bridge_token_norm": context_tokens.float().norm(dim=-1).mean(),
+            "query_token_norm": query_tokens.float().norm(dim=-1).mean(),
+        }
+        stats.update(scalar_mix_stats)
+        return query_tokens, query_mask, stats
 
 
 class QwenGemmaBridgeActionHead(nn.Module):
-    """Flow-matching head driven by a Gemma-style expert over bridged Qwen memory."""
+    """Flow-matching head driven by a GR00T-style token bridge plus Gemma expert."""
 
     def __init__(self, config: QwenGemmaBridgeActionConfig):
         super().__init__()
@@ -415,39 +679,28 @@ class QwenGemmaBridgeActionHead(nn.Module):
         self.action_encoder = ActionEncoder(action_dim=config.max_action_dim, hidden_dim=self.model_dim)
         self.time_mlp_in = nn.Linear(self.model_dim, self.model_dim)
         self.time_mlp_out = nn.Linear(self.model_dim, self.model_dim)
-        self.memory_bridge = QwenMemoryBridge(
+        self.bridge = GR00TQueryBridge(
             in_dim=int(config.vlm_hidden_dim),
-            out_dim=int(config.bridge_out_dim),
-            norm_type=str(config.bridge_norm_type),
+            policy_dim=int(config.bridge_policy_dim),
+            num_queries=int(config.bridge_num_queries),
+            num_layers=int(config.bridge_layers),
+            num_heads=int(config.num_heads),
+            state_dim=int(config.state_dim),
             dropout=float(config.bridge_dropout),
+            norm_type=str(config.bridge_norm_type),
             gate_bias=float(config.bridge_gate_bias),
+            use_state_token=bool(config.bridge_use_state_token),
+            use_tap_embeddings=bool(config.bridge_use_tap_embeddings),
+            use_token_type_embeddings=bool(config.bridge_use_token_type_embeddings),
+            max_taps=int(config.bridge_max_taps),
+            num_token_types=int(config.bridge_num_token_types),
+            scalar_mix=bool(config.bridge_scalar_mix),
+            scalar_mix_init=str(config.bridge_scalar_mix_init),
+            scalar_mix_use_gamma=bool(config.bridge_scalar_mix_use_gamma),
         )
         self.bridge_to_expert = nn.Identity()
-        if int(config.bridge_out_dim) != self.model_dim:
-            self.bridge_to_expert = nn.Linear(int(config.bridge_out_dim), self.model_dim, bias=False)
-        self.memory_summary_proj = nn.Sequential(
-            nn.Linear(self.model_dim, self.model_dim),
-            nn.SiLU(),
-            nn.Linear(self.model_dim, self.model_dim),
-        )
-        self.text_summary_proj = nn.Sequential(
-            nn.Linear(self.model_dim, self.model_dim),
-            nn.SiLU(),
-            nn.Linear(self.model_dim, self.model_dim),
-        )
-        self.instruction_summary_proj = nn.Sequential(
-            nn.Linear(int(config.vlm_hidden_dim), self.model_dim),
-            nn.SiLU(),
-            nn.Linear(self.model_dim, self.model_dim),
-        )
-        self.state_encoder = nn.Sequential(
-            nn.Linear(int(config.state_dim), self.model_dim),
-            nn.SiLU(),
-            nn.Linear(self.model_dim, self.model_dim),
-        )
-        self.memory_summary_gain = nn.Parameter(torch.tensor(float(config.memory_summary_gain_init)))
-        self.text_summary_gain = nn.Parameter(torch.tensor(float(config.text_summary_gain_init)))
-        self.instruction_summary_gain = nn.Parameter(torch.tensor(float(config.instruction_summary_gain_init)))
+        if int(config.bridge_policy_dim) != self.model_dim:
+            self.bridge_to_expert = nn.Linear(int(config.bridge_policy_dim), self.model_dim, bias=False)
         self.action_input_gain = nn.Parameter(torch.tensor(float(config.action_input_gain_init)))
         self.expert = GemmaActionExpert(
             hidden_dim=self.model_dim,
@@ -482,20 +735,6 @@ class QwenGemmaBridgeActionHead(nn.Module):
             + float(self.config.time_sampling_offset)
         )
 
-    def _masked_mean(
-        self,
-        values: torch.Tensor,
-        mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if mask is None:
-            return values.mean(dim=1)
-        weights = mask.to(device=values.device)
-        if weights.ndim == values.ndim - 1:
-            weights = weights.unsqueeze(-1)
-        weights = weights.to(values.dtype)
-        denom = weights.sum(dim=1).clamp(min=1.0)
-        return (values * weights).sum(dim=1) / denom
-
     def _time_condition(self, timestep: torch.Tensor) -> torch.Tensor:
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
@@ -512,120 +751,78 @@ class QwenGemmaBridgeActionHead(nn.Module):
         time_emb = self.time_mlp_out(time_emb)
         return F.silu(time_emb)
 
-    def _encode_state(
-        self,
-        state: Optional[torch.Tensor],
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        if not bool(self.config.use_state_conditioning) or state is None:
-            return torch.zeros(batch_size, self.model_dim, device=device, dtype=dtype)
-        state = state.to(
-            device=self.state_encoder[0].weight.device,
-            dtype=self.state_encoder[0].weight.dtype,
-        )
-        state = state[..., : int(self.config.state_dim)]
-        return self.state_encoder(state).to(device=device, dtype=dtype)
-
-    def _build_expert_condition(
-        self,
-        timestep: torch.Tensor,
-        memory_summary: torch.Tensor,
-        text_summary: Optional[torch.Tensor] = None,
-        instruction_summary: Optional[torch.Tensor] = None,
-        state: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        cond = self._time_condition(timestep)
-        if bool(self.config.use_memory_summary_conditioning):
-            memory_summary = memory_summary.to(
-                device=self.memory_summary_proj[0].weight.device,
-                dtype=self.memory_summary_proj[0].weight.dtype,
-            )
-            projected_memory = self.memory_summary_proj(memory_summary).to(device=cond.device, dtype=cond.dtype)
-            cond = cond + self.memory_summary_gain.to(device=cond.device, dtype=cond.dtype) * projected_memory
-        if bool(self.config.use_text_summary_conditioning):
-            text_summary = memory_summary if text_summary is None else text_summary
-            text_summary = text_summary.to(
-                device=self.text_summary_proj[0].weight.device,
-                dtype=self.text_summary_proj[0].weight.dtype,
-            )
-            projected_text = self.text_summary_proj(text_summary).to(device=cond.device, dtype=cond.dtype)
-            cond = cond + self.text_summary_gain.to(device=cond.device, dtype=cond.dtype) * projected_text
-        if bool(self.config.use_instruction_summary_conditioning) and instruction_summary is not None:
-            instruction_summary = instruction_summary.to(
-                device=self.instruction_summary_proj[0].weight.device,
-                dtype=self.instruction_summary_proj[0].weight.dtype,
-            )
-            projected_instruction = self.instruction_summary_proj(instruction_summary).to(
-                device=cond.device,
-                dtype=cond.dtype,
-            )
-            cond = cond + self.instruction_summary_gain.to(device=cond.device, dtype=cond.dtype) * projected_instruction
-        cond = cond + self._encode_state(
-            state=state,
-            batch_size=timestep.shape[0],
-            device=cond.device,
-            dtype=cond.dtype,
-        )
-        return cond
-
-    def prepare_memory(
-        self,
-        prefix_memory: torch.Tensor,
-        prefix_attention_mask: Optional[torch.Tensor] = None,
-        prefix_text_attention_mask: Optional[torch.Tensor] = None,
-        use_memory_conditioning: bool = True,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        if bool(self.config.stop_gradient_backbone):
-            prefix_memory = prefix_memory.detach()
-        memory = prefix_memory.to(
-            device=self.memory_bridge.proj.weight.device,
-            dtype=self.memory_bridge.proj.weight.dtype,
-        )
-        memory = self.memory_bridge(memory)
-        memory = self.bridge_to_expert(memory.to(self._module_dtype(self.bridge_to_expert, memory.dtype)))
-        memory_mask = prefix_attention_mask
-        if memory_mask is not None:
-            memory_mask = memory_mask.to(device=memory.device, dtype=torch.bool)
-        text_mask = prefix_text_attention_mask
-        if text_mask is not None:
-            text_mask = text_mask.to(device=memory.device, dtype=torch.bool)
-            if memory_mask is not None:
-                text_mask = text_mask & memory_mask
-        elif memory_mask is not None:
-            text_mask = memory_mask
-        if not use_memory_conditioning:
-            memory = torch.zeros_like(memory)
-        memory_summary = self._masked_mean(memory, memory_mask)
-        text_summary = self._masked_mean(memory, text_mask)
-        stats = {
-            "bridge_memory_norm": memory.float().norm(dim=-1).mean(),
-            "text_summary_norm": text_summary.float().norm(dim=-1).mean(),
-        }
-        return memory, memory_mask, memory_summary, text_summary, stats
-
     def _module_dtype(self, module: nn.Module, fallback: torch.dtype) -> torch.dtype:
         try:
             return next(module.parameters()).dtype
         except StopIteration:
             return fallback
 
+    def prepare_memory(
+        self,
+        prefix_memory: torch.Tensor,
+        prefix_attention_mask: Optional[torch.Tensor] = None,
+        tap_ids: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+        state: Optional[torch.Tensor] = None,
+        use_memory_conditioning: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        if bool(self.config.stop_gradient_backbone):
+            prefix_memory = prefix_memory.detach()
+
+        bridge_dtype = next(self.bridge.parameters()).dtype
+        bridge_device = next(self.bridge.parameters()).device
+        memory = prefix_memory.to(device=bridge_device, dtype=bridge_dtype)
+        if prefix_attention_mask is None:
+            prefix_attention_mask = torch.ones(
+                memory.shape[0],
+                memory.shape[1],
+                device=memory.device,
+                dtype=torch.bool,
+            )
+        else:
+            prefix_attention_mask = prefix_attention_mask.to(device=memory.device, dtype=torch.bool)
+        if tap_ids is not None:
+            tap_ids = tap_ids.to(device=memory.device, dtype=torch.long)
+        if token_type_ids is not None:
+            token_type_ids = token_type_ids.to(device=memory.device, dtype=torch.long)
+        if not use_memory_conditioning:
+            memory = torch.zeros_like(memory)
+
+        bridge_state = None
+        if bool(self.config.bridge_use_state_token) and state is not None:
+            bridge_state = state.to(device=bridge_device, dtype=bridge_dtype)
+
+        query_tokens, query_mask, stats = self.bridge(
+            memory=memory,
+            memory_mask=prefix_attention_mask,
+            state=bridge_state,
+            tap_ids=tap_ids,
+            token_type_ids=token_type_ids,
+        )
+        query_tokens = self.bridge_to_expert(
+            query_tokens.to(self._module_dtype(self.bridge_to_expert, query_tokens.dtype))
+        )
+        query_tokens = query_tokens.to(device=self.action_out_proj.weight.device, dtype=self.action_out_proj.weight.dtype)
+        stats["bridge_memory_norm"] = query_tokens.float().norm(dim=-1).mean()
+        return query_tokens, query_mask.to(device=query_tokens.device), stats
+
     def _predict_velocity(
         self,
         prefix_memory: torch.Tensor,
         prefix_attention_mask: Optional[torch.Tensor],
-        prefix_text_attention_mask: Optional[torch.Tensor],
-        instruction_summary: Optional[torch.Tensor],
+        tap_ids: Optional[torch.Tensor],
+        token_type_ids: Optional[torch.Tensor],
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
         state: Optional[torch.Tensor] = None,
         use_memory_conditioning: bool = True,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        memory, memory_mask, memory_summary, text_summary, stats = self.prepare_memory(
-            prefix_memory,
-            prefix_attention_mask,
-            prefix_text_attention_mask=prefix_text_attention_mask,
+        memory, memory_mask, stats = self.prepare_memory(
+            prefix_memory=prefix_memory,
+            prefix_attention_mask=prefix_attention_mask,
+            tap_ids=tap_ids,
+            token_type_ids=token_type_ids,
+            state=state,
             use_memory_conditioning=use_memory_conditioning,
         )
         noisy_actions = noisy_actions.to(
@@ -633,13 +830,7 @@ class QwenGemmaBridgeActionHead(nn.Module):
             dtype=self.action_out_proj.weight.dtype,
         )
         timestep = timestep.to(device=noisy_actions.device, dtype=noisy_actions.dtype)
-        expert_cond = self._build_expert_condition(
-            timestep,
-            memory_summary,
-            text_summary=text_summary,
-            instruction_summary=instruction_summary,
-            state=state,
-        )
+        expert_cond = self._time_condition(timestep)
         action_tokens = self.action_encoder(noisy_actions, timestep)
         if bool(self.config.use_action_input_conditioning):
             action_tokens = action_tokens + (
@@ -658,9 +849,25 @@ class QwenGemmaBridgeActionHead(nn.Module):
         memory_norm = stats["bridge_memory_norm"].float()
         stats["expert_token_norm"] = action_norm
         stats["memory_norm_ratio"] = memory_norm / action_norm.clamp(min=1e-6)
-        self.last_bridge_stats = {
-            key: float(value.detach().cpu().item()) for key, value in stats.items()
-        }
+        per_sample_memory_norm = memory.float().norm(dim=-1).mean(dim=-1)
+        per_sample_action_norm = action_tokens.float().norm(dim=-1).mean(dim=-1).clamp(min=1e-6)
+        per_sample_ratio = per_sample_memory_norm / per_sample_action_norm
+        stats["mean_norm_saturation_fraction"] = (
+            per_sample_ratio > float(self.config.memory_norm_ratio_limit)
+        ).float().mean()
+        if self.expert.last_cross_attn_entropy is not None:
+            stats["cross_attn_entropy"] = self.expert.last_cross_attn_entropy.float()
+        serialized_stats: dict[str, float | list[float]] = {}
+        for key, value in stats.items():
+            if torch.is_tensor(value):
+                detached = value.detach().cpu()
+                if detached.numel() == 1:
+                    serialized_stats[key] = float(detached.item())
+                else:
+                    serialized_stats[key] = detached.flatten().tolist()
+            else:
+                serialized_stats[key] = value
+        self.last_bridge_stats = serialized_stats
         return velocity, stats
 
     def forward(
@@ -669,8 +876,8 @@ class QwenGemmaBridgeActionHead(nn.Module):
         prefix_attention_mask: Optional[torch.Tensor],
         actions: torch.Tensor,
         state: Optional[torch.Tensor] = None,
-        prefix_text_attention_mask: Optional[torch.Tensor] = None,
-        instruction_summary: Optional[torch.Tensor] = None,
+        tap_ids: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         batch_size = actions.shape[0]
         device = actions.device
@@ -686,29 +893,40 @@ class QwenGemmaBridgeActionHead(nn.Module):
         v_t, stats = self._predict_velocity(
             prefix_memory=prefix_memory,
             prefix_attention_mask=prefix_attention_mask,
-            prefix_text_attention_mask=prefix_text_attention_mask,
-            instruction_summary=instruction_summary,
+            tap_ids=tap_ids,
+            token_type_ids=token_type_ids,
             noisy_actions=x_t,
             timestep=timestep,
             state=state,
         )
         loss = F.mse_loss(v_t, u_t)
-        return {
+        result = {
             "loss": loss,
             "motion_loss": loss,
             "predicted_velocity": v_t,
+            "raw_qwen_token_norm": stats["raw_qwen_token_norm"],
+            "bridge_token_norm": stats["bridge_token_norm"],
+            "query_token_norm": stats["query_token_norm"],
             "bridge_memory_norm": stats["bridge_memory_norm"],
             "expert_token_norm": stats["expert_token_norm"],
             "memory_norm_ratio": stats["memory_norm_ratio"],
+            "mean_norm_saturation_fraction": stats["mean_norm_saturation_fraction"],
         }
+        if "cross_attn_entropy" in stats:
+            result["cross_attn_entropy"] = stats["cross_attn_entropy"]
+        if "tap_weight_entropy" in stats:
+            result["tap_weight_entropy"] = stats["tap_weight_entropy"]
+        if "scalar_mix_gamma" in stats:
+            result["scalar_mix_gamma"] = stats["scalar_mix_gamma"]
+        return result
 
     @torch.no_grad()
     def predict_action(
         self,
         prefix_memory: torch.Tensor,
         prefix_attention_mask: Optional[torch.Tensor],
-        prefix_text_attention_mask: Optional[torch.Tensor] = None,
-        instruction_summary: Optional[torch.Tensor] = None,
+        tap_ids: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
         state: Optional[torch.Tensor] = None,
         num_steps: Optional[int] = None,
         deterministic_seed: Optional[int] = None,
@@ -733,8 +951,8 @@ class QwenGemmaBridgeActionHead(nn.Module):
             v_t, _ = self._predict_velocity(
                 prefix_memory=prefix_memory,
                 prefix_attention_mask=prefix_attention_mask,
-                prefix_text_attention_mask=prefix_text_attention_mask,
-                instruction_summary=instruction_summary,
+                tap_ids=tap_ids,
+                token_type_ids=token_type_ids,
                 noisy_actions=x_t,
                 timestep=timestep,
                 state=state,
