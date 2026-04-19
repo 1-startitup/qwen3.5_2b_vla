@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class Qwen35GemmaBridgeVLA(nn.Module):
     """Qwen backbone + cross-attention Gemma-style action expert."""
 
-    architecture_name = "qwen_3.5_2b_gemma_bridge_v3_1"
+    architecture_name = "qwen_3.5_2b_gemma_bridge_v3_2"
 
     def __init__(
         self,
@@ -67,7 +67,7 @@ class Qwen35GemmaBridgeVLA(nn.Module):
             if self.freeze_vlm:
                 for param in self.vlm.parameters():
                     param.requires_grad = False
-                logger.info("Frozen entire Qwen backbone for v3.1 bridge training")
+                logger.info("Frozen entire Qwen backbone for v3.2 bridge training")
 
         self._log_param_counts()
 
@@ -99,7 +99,7 @@ class Qwen35GemmaBridgeVLA(nn.Module):
         self.vlm.model = get_peft_model(self.vlm.model, peft_config)
         self.vlm.model.print_trainable_parameters()
         logger.info(
-            "LoRA applied to qwen_3.5_2b_gemma_bridge_v3_1: r=%s alpha=%s",
+            "LoRA applied to qwen_3.5_2b_gemma_bridge_v3_2: r=%s alpha=%s",
             peft_config.r,
             peft_config.lora_alpha,
         )
@@ -109,12 +109,13 @@ class Qwen35GemmaBridgeVLA(nn.Module):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         action_params = sum(p.numel() for p in self.action_head.parameters())
         logger.info(
-            "Qwen35GemmaBridgeVLA | Total: %.2fB | Trainable: %.1fM | Action head: %.1fM | Variant: %s | Tap strategy: %s",
+            "Qwen35GemmaBridgeVLA | Total: %.2fB | Trainable: %.1fM | Action head: %.1fM | Variant: %s | Tap strategy: %s | Bridge: %s",
             total / 1e9,
             trainable / 1e6,
             action_params / 1e6,
             self.action_config.action_expert_variant,
             self.action_config.tap_strategy,
+            self.action_config.bridge_type,
         )
 
     def _action_head_dtype(self) -> torch.dtype:
@@ -167,7 +168,7 @@ class Qwen35GemmaBridgeVLA(nn.Module):
         state: Optional[torch.Tensor],
     ) -> List[str]:
         if state is None:
-            raise ValueError("v3.1 bridge requires state to build pi0.5-style prompts")
+            raise ValueError("v3.2 bridge requires state to build pi0.5-style prompts")
 
         bins = int(getattr(self.action_config, "state_prompt_bins", 256))
         norm_state = self.normalize_states(state.detach().float().cpu())
@@ -228,15 +229,27 @@ class Qwen35GemmaBridgeVLA(nn.Module):
         )
         action_out = self.action_head(
             prefix_memory=prefix_memory["memory"],
-            prefix_attention_mask=prefix_memory["attention_mask"],
-            prefix_text_attention_mask=prefix_memory.get("text_attention_mask"),
-            instruction_summary=prefix_memory.get("instruction_summary"),
+            prefix_attention_mask=prefix_memory["memory_mask"],
+            tap_ids=prefix_memory.get("tap_ids"),
+            token_type_ids=prefix_memory.get("token_type_ids"),
             actions=norm_actions,
             state=norm_state,
         )
 
         result = {"action_loss": action_out["loss"], "total_loss": action_out["loss"]}
-        for key in ("motion_loss", "bridge_memory_norm", "expert_token_norm", "memory_norm_ratio"):
+        for key in (
+            "motion_loss",
+            "raw_qwen_token_norm",
+            "bridge_token_norm",
+            "query_token_norm",
+            "bridge_memory_norm",
+            "expert_token_norm",
+            "cross_attn_entropy",
+            "memory_norm_ratio",
+            "tap_weight_entropy",
+            "scalar_mix_gamma",
+            "mean_norm_saturation_fraction",
+        ):
             if key in action_out:
                 result[key] = action_out[key]
 
@@ -268,7 +281,7 @@ class Qwen35GemmaBridgeVLA(nn.Module):
         del history, inference_delay, prev_chunk_left_over, execution_horizon
         self.eval()
         if state is None:
-            raise ValueError("v3.1 bridge predict_action requires state")
+            raise ValueError("v3.2 bridge predict_action requires state")
 
         prompts = self._build_pi05_prompts(instructions, state)
         prefix_ctx = self.backbone.encode_prefix(images=images, prompts=prompts)
@@ -279,9 +292,9 @@ class Qwen35GemmaBridgeVLA(nn.Module):
         norm_state = self.normalize_states(state).to(self._action_head_dtype())
         norm_actions = self.action_head.predict_action(
             prefix_memory=prefix_memory["memory"],
-            prefix_attention_mask=prefix_memory["attention_mask"],
-            prefix_text_attention_mask=prefix_memory.get("text_attention_mask"),
-            instruction_summary=prefix_memory.get("instruction_summary"),
+            prefix_attention_mask=prefix_memory["memory_mask"],
+            tap_ids=prefix_memory.get("tap_ids"),
+            token_type_ids=prefix_memory.get("token_type_ids"),
             state=norm_state,
             num_steps=num_inference_steps,
             deterministic_seed=deterministic_seed,
@@ -302,7 +315,7 @@ class Qwen35GemmaBridgeVLA(nn.Module):
         for name, param in self.action_head.named_parameters():
             if not param.requires_grad:
                 continue
-            if "bias" in name or "norm" in name or "gate" in name:
+            if "bias" in name or "norm" in name or "gate" in name or "scalar_mixer" in name:
                 action_no_decay.append(param)
             else:
                 action_decay.append(param)

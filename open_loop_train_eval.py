@@ -119,9 +119,9 @@ def _predict_norm_actions(model, batch, num_inference_steps: int | None, determi
         norm_state = model.normalize_states(state).to(model._action_head_dtype()) if state is not None else None
         return model.action_head.predict_action(
             prefix_memory=prefix_memory["memory"],
-            prefix_attention_mask=prefix_memory["attention_mask"],
-            prefix_text_attention_mask=prefix_memory.get("text_attention_mask"),
-            instruction_summary=prefix_memory.get("instruction_summary"),
+            prefix_attention_mask=prefix_memory["memory_mask"],
+            tap_ids=prefix_memory.get("tap_ids"),
+            token_type_ids=prefix_memory.get("token_type_ids"),
             state=norm_state,
             num_steps=num_inference_steps,
             deterministic_seed=deterministic_seed,

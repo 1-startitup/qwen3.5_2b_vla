@@ -121,6 +121,29 @@ class QwenBackboneAdapter(nn.Module):
             return text_mask
         return text_mask & (mm_token_type_ids == 0)
 
+    def _token_type_ids(
+        self,
+        encoded_prefix: Dict[str, Any],
+    ) -> Optional[torch.Tensor]:
+        attention_mask = encoded_prefix.get("attention_mask", None)
+        if attention_mask is None:
+            return None
+
+        vlm_inputs = encoded_prefix.get("vlm_inputs", {})
+        mm_token_type_ids = vlm_inputs.get("mm_token_type_ids", None)
+        if mm_token_type_ids is None:
+            return torch.zeros_like(attention_mask, dtype=torch.long)
+
+        mm_token_type_ids = mm_token_type_ids.to(device=attention_mask.device)
+        if mm_token_type_ids.shape != attention_mask.shape:
+            logger.warning(
+                "Ignoring mm_token_type_ids with mismatched shape: %s vs %s",
+                tuple(mm_token_type_ids.shape),
+                tuple(attention_mask.shape),
+            )
+            return torch.zeros_like(attention_mask, dtype=torch.long)
+        return mm_token_type_ids.to(dtype=torch.long)
+
     def _instruction_summary(
         self,
         encoded_prefix: Dict[str, Any],
@@ -143,24 +166,43 @@ class QwenBackboneAdapter(nn.Module):
 
         tap_tensors = [hidden_states[idx + 1] for idx in tap_indices]
         strategy = str(tap_strategy).lower()
+        base_attention_mask = encoded_prefix["attention_mask"].to(dtype=torch.bool)
+        base_token_type_ids = self._token_type_ids(encoded_prefix)
         if strategy == "last":
             selected_indices = [tap_indices[-1]]
             selected_tensors = [tap_tensors[-1]]
             memory = selected_tensors[0]
-        elif strategy in {"all", "mean_all", "all_mean"}:
+            memory_mask = base_attention_mask
+            tap_ids = torch.full_like(base_attention_mask, fill_value=selected_indices[0], dtype=torch.long)
+            token_type_ids = base_token_type_ids
+        elif strategy in {"all_concat", "concat_all", "all", "scalar_mix"}:
             selected_indices = tap_indices
             selected_tensors = tap_tensors
-            memory = torch.stack(selected_tensors, dim=0).mean(dim=0)
+            memory = torch.cat(selected_tensors, dim=1)
+            memory_mask = torch.cat([base_attention_mask for _ in selected_tensors], dim=1)
+            tap_ids = torch.cat(
+                [
+                    torch.full_like(base_attention_mask, fill_value=layer_idx, dtype=torch.long)
+                    for layer_idx in selected_indices
+                ],
+                dim=1,
+            )
+            token_type_ids = None
+            if base_token_type_ids is not None:
+                token_type_ids = torch.cat([base_token_type_ids for _ in selected_tensors], dim=1)
         else:
-            raise ValueError(f"Unsupported tap_strategy={tap_strategy}. Expected one of ['last', 'all']")
+            raise ValueError(
+                f"Unsupported tap_strategy={tap_strategy}. Expected one of ['last', 'all_concat', 'scalar_mix']"
+            )
 
         return {
             "tap_indices": selected_indices,
             "tap_tensors": selected_tensors,
             "memory": memory,
-            "attention_mask": encoded_prefix["attention_mask"],
-            "text_attention_mask": self._text_attention_mask(encoded_prefix),
-            "instruction_summary": self._instruction_summary(encoded_prefix),
+            "memory_mask": memory_mask,
+            "attention_mask": memory_mask,
+            "tap_ids": tap_ids,
+            "token_type_ids": token_type_ids,
         }
 
     def get_prefix_memory(
@@ -171,8 +213,9 @@ class QwenBackboneAdapter(nn.Module):
         taps = self.get_full_attention_taps(encoded_prefix, tap_strategy=tap_strategy)
         return {
             "memory": taps["memory"],
+            "memory_mask": taps["memory_mask"],
             "attention_mask": taps["attention_mask"],
-            "text_attention_mask": taps["text_attention_mask"],
-            "instruction_summary": taps["instruction_summary"],
+            "tap_ids": taps["tap_ids"],
+            "token_type_ids": taps["token_type_ids"],
             "tap_indices": taps["tap_indices"],
         }

@@ -9,6 +9,7 @@ from .qwen_gemma_bridge_action_head import (
     QwenGemmaBridgeActionConfig,
     QwenGemmaBridgeActionHead,
     GemmaActionExpert,
+    GR00TQueryBridge,
 )
 from .qwen_backbone_adapter import QwenBackboneAdapter
 from .qwen35_pi05_interface import Qwen35PI05Interface
@@ -38,6 +39,7 @@ __all__ = [
     "QwenGemmaBridgeActionHead",
     "QwenGemmaBridgeActionConfig",
     "GemmaActionExpert",
+    "GR00TQueryBridge",
     "FlowMatchingActionHead",
     "LayerwiseFlowMatchingActionHead",
     "LayerwiseFlowMatchingConfig",
