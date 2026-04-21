@@ -1,0 +1,86 @@
+# Qwen3.5-VL + Pi 0.5 action expert — LIBERO training config.
+#
+# Mirrors openpi pi05_libero (training/config.py:744-763), swapping the
+# VLM backbone from PaliGemma to Qwen3.5-VL. Action expert is gemma_300m-
+# sized, trained from scratch (no pi05_base weights to inherit after the
+# backbone swap). Action prompt is plain instruction — state is not
+# discretized into the prompt, matching Pi 0.5 libero discrete_state_input=False.
+#
+# Launch (effective batch = 256):
+#   accelerate launch --config_file config/deepspeed_zero2_single_fast.yaml \
+#     --num_processes 8 train.py --config config/libero_train_qwen_3_5_2b_pi05.yaml
+
+model:
+  vlm_model_id: "/home/frankkkz/pretrained_models/Qwen3.5-2B"
+  attn_implementation: "sdpa"
+  freeze_vision_encoder: false
+  freeze_vlm: false      # Pi 0.5 libero: full fine-tune
+
+action_head:
+  action_expert_variant: "gemma_300m"      # 18 layers × 1024 hidden, head_dim inherited from Qwen
+  hidden_dim: 1024
+  num_layers: 18
+  action_dim: 7
+  action_horizon: 10
+  chunk_size: 10
+  max_state_dim: 32
+  max_action_dim: 32
+  # Flow matching (exact Pi 0.5 values)
+  beta_alpha: 1.5
+  beta_beta: 1.0
+  time_sampling_scale: 0.999
+  time_sampling_offset: 0.001
+  min_period: 0.004
+  max_period: 4.0
+  num_inference_steps: 10
+  # Multimodal input
+  state_dim: 8
+  tokenizer_max_length: 320       # 3 cams × 64 img tokens = 192, plus chat template + text; 320 leaves headroom
+  image_resolution: [224, 224]
+  empty_cameras: 1      # matches Pi 0.5 libero's 3 cams (right_wrist empty)
+
+dataset:
+  name: "lerobot/libero_spatial_image"
+  data_root: "/home/frankkkz/datasets"
+  action_type: "delta_qpos"
+  image_size: [224, 224]
+  batch_size: 32         # per-GPU; 8 GPUs × 32 × 1 accum = 256 eff
+  num_workers: 4
+  prefetch_factor: 4
+  max_train_samples: 0
+  subset_seed: 42
+  norm_stats_sample_size: 20000
+  tokenizer_padding_side: "right"
+  tokenizer_max_length: 320
+  prompt_style: "plain"  # VLA builds the `Task: X;\nAction: ` prompt itself
+  image_resize_mode: "stretch"
+  empty_cameras: 1
+  shuffle: true
+  drop_last: true
+
+training:
+  max_steps: 30000
+  eval_every: 2000
+  save_every: 2000
+  save_optimizer_state: true
+  log_every: 20
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  seed: 42
+  gradient_checkpointing: true
+
+  lr: 5.0e-5             # Pi 0.5 libero peak_lr (unified across VLM + expert)
+  min_lr: 5.0e-5         # == lr → constant after warmup (Pi 0.5 decay_steps=1M)
+  weight_decay: 1.0e-10  # Pi 0.5 AdamW wd
+  betas: [0.9, 0.95]     # Pi 0.5 b1=0.9, b2=0.95
+  eps: 1.0e-8
+
+  warmup_steps: 10000
+
+  ema_decay: 0.999               # Pi 0.5 libero EMA; eval swaps in EMA weights (openpi checkpoints.py:146)
+
+  mixed_precision: "bf16"
+
+  wandb_project: ""
+  wandb_run_name: "qwen_3.5_2b_pi05_libero_spatial"
+  output_dir: "./checkpoints/qwen_3.5_2b_pi05_libero_spatial"
