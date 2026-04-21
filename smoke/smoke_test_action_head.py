@@ -25,7 +25,9 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
 def main():
     torch.manual_seed(0)
-    device = torch.device("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    print(f"device                  : {device}")
 
     # -- Build a tiny Qwen3.5 text backbone --------------------------------
     # Mirrors real Qwen3.5 structure: hybrid full/linear-attention layer types.
@@ -44,7 +46,7 @@ def main():
     text_cfg.layer_types = ["full_attention", "linear_attention", "full_attention", "linear_attention"]
     print(f"tiny Qwen3_5TextConfig  : {text_cfg.num_hidden_layers} layers  layer_types={text_cfg.layer_types}")
 
-    language_model = Qwen3_5TextModel(text_cfg).to(device=device, dtype=torch.bfloat16)
+    language_model = Qwen3_5TextModel(text_cfg).to(device=device, dtype=dtype)
     language_model.eval()
     lm_params = sum(p.numel() for p in language_model.parameters())
     print(f"language_model params   : {lm_params/1e6:.2f}M")
@@ -61,7 +63,7 @@ def main():
         num_inference_steps=3,
         state_dim=8,
     )
-    head = QwenPI05ExpertHead(action_cfg).to(device=device, dtype=torch.bfloat16)
+    head = QwenPI05ExpertHead(action_cfg).to(device=device, dtype=dtype)
     head._ensure_initialized(language_model)
     head_params = sum(p.numel() for p in head.parameters())
     print(f"action expert params    : {head_params/1e6:.2f}M")
@@ -70,7 +72,7 @@ def main():
 
     # -- Dummy batch --------------------------------------------------------
     B, P = 2, 16
-    prefix_embeds = torch.randn(B, P, text_cfg.hidden_size, device=device, dtype=torch.bfloat16)
+    prefix_embeds = torch.randn(B, P, text_cfg.hidden_size, device=device, dtype=dtype)
     prefix_mask = torch.ones(B, P, device=device, dtype=torch.long)
     prefix_mask[0, -3:] = 0  # exercise padding in the mask
     actions = torch.randn(B, action_cfg.action_horizon, action_cfg.action_dim, device=device) * 0.3
@@ -130,8 +132,9 @@ def main():
     assert torch.isfinite(pred).all(), "non-finite predicted actions"
 
     # Memory summary.
-    mem_gb = torch.cuda.max_memory_allocated() / 1e9
-    print(f"peak GPU memory         : {mem_gb:.2f} GB")
+    if device.type == "cuda":
+        mem_gb = torch.cuda.max_memory_allocated() / 1e9
+        print(f"peak GPU memory         : {mem_gb:.2f} GB")
     print(">>> action-head smoke test PASSED <<<")
 
 

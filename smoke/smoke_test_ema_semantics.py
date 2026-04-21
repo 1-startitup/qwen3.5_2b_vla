@@ -9,7 +9,9 @@ from train import EMA
 
 def main():
     torch.manual_seed(0)
-    m = nn.Linear(4, 4).cuda()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device               : {device}")
+    m = nn.Linear(4, 4).to(device)
     ema = EMA(m, decay=0.9, offload_to_cpu=False)
 
     # Simulate 10 SGD steps that move params in one direction.

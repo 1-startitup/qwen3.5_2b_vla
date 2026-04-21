@@ -29,10 +29,12 @@ class Qwen35PI05VLA(nn.Module):
         freeze_vision_encoder: bool = False,
         freeze_vlm: bool = False,
         attn_implementation: Optional[str] = None,
+        architecture_name: Optional[str] = None,
     ):
         super().__init__()
         if action_config is None:
             action_config = QwenPI05ActionConfig()
+        self.architecture_name = str(architecture_name or self.architecture_name)
 
         self.vlm = Qwen35PI05Interface(
             model_id=vlm_model_id,
@@ -64,8 +66,11 @@ class Qwen35PI05VLA(nn.Module):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         action_params = sum(p.numel() for p in self.action_head.parameters())
         logger.info(
-            "Qwen35PI05VLA | total=%.2fB trainable=%.1fM action_expert=%.1fM",
-            total / 1e9, trainable / 1e6, action_params / 1e6,
+            "%s | total=%.2fB trainable=%.1fM action_expert=%.1fM",
+            self.architecture_name,
+            total / 1e9,
+            trainable / 1e6,
+            action_params / 1e6,
         )
 
     # ---------- module access ----------------------------------------------

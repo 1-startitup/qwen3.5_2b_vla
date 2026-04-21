@@ -7,10 +7,10 @@ Pi 0.5 "constant after warmup" recipe).
 Usage:
     # 8 GPUs
     accelerate launch --config_file config/deepspeed_zero2_single_fast.yaml \
-        --num_processes 8 train.py --config config/libero_train_qwen_3_5_2b_pi05.yaml
+        --num_processes 8 train.py --config config/libero_train_qwen_3_5_2b_pi05_v3_3.yaml
 
     # single GPU (raise grad-accum to compensate)
-    python train.py --config config/libero_train_qwen_3_5_2b_pi05.yaml \
+    python train.py --config config/libero_train_qwen_3_5_2b_pi05_v3_3.yaml \
         --training.gradient_accumulation_steps 8
 """
 
@@ -119,11 +119,11 @@ def parse_args():
 # ---------- builders ---------------------------------------------------------
 
 def build_model(cfg):
-    from model import Qwen35PI05VLA, QwenPI05ActionConfig, ACTION_EXPERT_VARIANTS
+    from model import Qwen35V33VLA, QwenV33ActionConfig, ACTION_EXPERT_VARIANTS
 
     ah = cfg.action_head
     variant = ACTION_EXPERT_VARIANTS[str(ah.get("action_expert_variant", "gemma_300m"))]
-    action_config = QwenPI05ActionConfig(
+    action_config = QwenV33ActionConfig(
         head_type=str(ah.get("head_type", "pi05_qwen")),
         action_expert_variant=str(ah.get("action_expert_variant", "gemma_300m")),
         hidden_dim=int(ah.get("hidden_dim", variant["hidden_dim"])),
@@ -146,12 +146,13 @@ def build_model(cfg):
         empty_cameras=int(ah.get("empty_cameras", cfg.dataset.get("empty_cameras", 1))),
     )
 
-    return Qwen35PI05VLA(
+    return Qwen35V33VLA(
         vlm_model_id=cfg.model.vlm_model_id,
         action_config=action_config,
         freeze_vision_encoder=bool(cfg.model.get("freeze_vision_encoder", False)),
         freeze_vlm=bool(cfg.model.get("freeze_vlm", False)),
         attn_implementation=cfg.model.get("attn_implementation", None),
+        architecture_name=str(cfg.model.get("architecture", "qwen_3.5_2b_pi05_v3_3")),
     )
 
 
@@ -330,7 +331,7 @@ def main():
     if accelerator.is_main_process:
         Path(tcfg.output_dir).mkdir(parents=True, exist_ok=True)
         print("=" * 60)
-        print("Qwen3.5-VL + Pi 0.5 training on LIBERO")
+        print("Qwen3.5-VL + Pi 0.5 v3.3 training on LIBERO")
         print("=" * 60)
         print(f"  backbone       : {cfg.model.vlm_model_id}")
         print(f"  action expert  : {cfg.action_head.action_expert_variant}")
